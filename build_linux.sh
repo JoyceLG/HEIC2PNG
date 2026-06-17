@@ -11,11 +11,11 @@ if [ ! -d ".venv" ]; then
 fi
 
 source .venv/bin/activate
-pip install --quiet "pyinstaller>=6.0"
+python -m pip install --quiet "pyinstaller>=6.0"
 
 rm -rf build/ dist/
 
-pyinstaller \
+python -m PyInstaller \
     --name=heic2png \
     --onedir \
     --windowed \

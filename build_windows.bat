@@ -12,12 +12,12 @@ if not exist ".venv" (
 
 call .venv\Scripts\activate.bat
 
-pip install --quiet "pyinstaller>=6.0"
+python -m pip install --quiet "pyinstaller>=6.0"
 
 if exist build rmdir /s /q build
 if exist dist  rmdir /s /q dist
 
-pyinstaller ^
+python -m PyInstaller ^
     --name=heic2png ^
     --onedir ^
     --windowed ^
