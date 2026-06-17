@@ -6,6 +6,7 @@ import logging
 import os
 
 from PySide6.QtCore import Qt, QThread, QTimer
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QSplitter,
+    QStyle,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -53,6 +55,7 @@ class _ImportDialog(QDialog):
         row = QHBoxLayout()
         row.addStretch(1)
         btn = QPushButton("Annuler")
+        btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogCancelButton))
         btn.clicked.connect(self.reject)
         row.addWidget(btn)
         layout.addLayout(row)
@@ -131,14 +134,20 @@ class MainWindow(QMainWindow):
         self.drop_zone.folders_dropped.connect(self.add_folders)
         layout.addWidget(self.drop_zone)
 
+        sp = QStyle.StandardPixmap
+        s = self.style()
         buttons = QHBoxLayout()
         add_files_btn = QPushButton("Ajouter des photos…")
+        add_files_btn.setIcon(s.standardIcon(sp.SP_FileDialogStart))
         add_files_btn.clicked.connect(self._choose_files)
         add_folder_btn = QPushButton("Ajouter un dossier…")
+        add_folder_btn.setIcon(s.standardIcon(sp.SP_DirIcon))
         add_folder_btn.clicked.connect(self._choose_folder)
         self.remove_btn = QPushButton("Retirer la sélection")
+        self.remove_btn.setIcon(s.standardIcon(sp.SP_DialogDiscardButton))
         self.remove_btn.clicked.connect(self._remove_selected)
         self.clear_btn = QPushButton("Tout vider")
+        self.clear_btn.setIcon(s.standardIcon(sp.SP_TrashIcon))
         self.clear_btn.clicked.connect(self._clear_all)
         self.count_label = QLabel("0 photo")
         buttons.addWidget(add_files_btn)
@@ -213,6 +222,7 @@ class MainWindow(QMainWindow):
         self.dest_edit = QLineEdit()
         self.dest_edit.setPlaceholderText("Dossier de destination…")
         browse_btn = QPushButton("Parcourir…")
+        browse_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon))
         browse_btn.clicked.connect(self._choose_destination)
         dest_row.addWidget(QLabel("Destination :"))
         dest_row.addWidget(self.dest_edit, 1)
@@ -229,11 +239,16 @@ class MainWindow(QMainWindow):
         layout.addLayout(options_row)
 
         action_row = QHBoxLayout()
+        sp = QStyle.StandardPixmap
+        s = self.style()
         self.convert_btn = QPushButton("Convertir")
+        self.convert_btn.setIcon(s.standardIcon(sp.SP_MediaPlay))
         self.convert_btn.clicked.connect(self._start_conversion)
         self.convert_selected_btn = QPushButton("Convertir la sélection")
+        self.convert_selected_btn.setIcon(s.standardIcon(sp.SP_MediaPlay))
         self.convert_selected_btn.clicked.connect(self._start_conversion_selected)
         self.cancel_btn = QPushButton("Annuler")
+        self.cancel_btn.setIcon(s.standardIcon(sp.SP_MediaStop))
         self.cancel_btn.clicked.connect(self._cancel_conversion)
         self.cancel_btn.setEnabled(False)
         action_row.addStretch(1)
@@ -286,6 +301,7 @@ class MainWindow(QMainWindow):
         """Analyse un ou plusieurs dossiers en arrière-plan puis importe."""
         if not folders:
             return
+        _logger.info("add_folders: %s", folders)
         self._scanning = True
         dlg = self._ensure_import_dialog()
         dlg.set_label("Analyse du dossier…")
@@ -308,6 +324,7 @@ class MainWindow(QMainWindow):
 
     def add_paths(self, paths: list[str]) -> None:
         """Ajoute une liste de chemins HEIC (glisser-déposer, sélection)."""
+        _logger.info("add_paths: %d fichier(s)", len(paths))
         self._ingest_paths(paths)
 
     def _ingest_paths(self, paths: list[str]) -> None:
@@ -363,11 +380,13 @@ class MainWindow(QMainWindow):
         paths = self.gallery.selected_paths()
         if not paths:
             return
+        _logger.info("remove_selected: %d photo(s)", len(paths))
         self.store.remove(paths)
         self.gallery.refresh()
         self._update_count()
 
     def _clear_all(self) -> None:
+        _logger.info("clear_all: %d photo(s) supprimées", len(self.store))
         self.store.clear()
         self.gallery.refresh()
         self._update_count()
@@ -474,7 +493,9 @@ class MainWindow(QMainWindow):
         self._launch_conversion(paths)
 
     def _launch_conversion(self, paths: list[str]) -> None:
+        _logger.info("launch_conversion: %d photo(s) demandées", len(paths))
         if self._conversion_thread is not None:
+            _logger.warning("launch_conversion: refusé — conversion déjà en cours")
             QMessageBox.information(
                 self, "Conversion en cours", "Une conversion est déjà en cours."
             )
@@ -550,6 +571,7 @@ class MainWindow(QMainWindow):
             self._on_selection_changed(item)
 
     def _on_conversion_finished(self, success: int, failures: int, skipped: int) -> None:
+        _logger.info("conversion terminée: %d OK / %d ignoré(s) / %d erreur(s)", success, skipped, failures)
         self._set_converting(False)
         parts = [f"{success} réussite(s)"]
         if skipped:

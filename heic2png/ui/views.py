@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
+
+_logger = logging.getLogger(__name__)
 
 from PIL import Image
 from PySide6.QtCore import QObject, QSize, Qt, QTimer, Signal
@@ -94,6 +97,13 @@ class PhotoGallery(QWidget):
         self._table_rows: dict[str, int] = {}
         self._order: list[str] = []
         self._thumb_requested: set[str] = set()
+
+        # Anti-rebond du tri : évite de relancer refresh() à chaque frappe rapide.
+        self._sort_timer = QTimer(self)
+        self._sort_timer.setSingleShot(True)
+        self._sort_timer.setInterval(150)
+        self._sort_timer.timeout.connect(self.refresh)
+
         self._build_ui()
 
         # Demande différée des vignettes visibles (anti-rebond du défilement).
@@ -121,7 +131,7 @@ class PhotoGallery(QWidget):
         toolbar.addWidget(QLabel("Trier par :"))
         self.sort_combo = QComboBox()
         self.sort_combo.addItems(SORT_KEYS.keys())
-        self.sort_combo.currentIndexChanged.connect(self.refresh)
+        self.sort_combo.currentIndexChanged.connect(self._sort_timer.start)
         toolbar.addWidget(self.sort_combo)
         toolbar.addStretch(1)
         layout.addLayout(toolbar)
@@ -169,14 +179,17 @@ class PhotoGallery(QWidget):
     def refresh(self) -> None:
         """Reconstruit entièrement les deux vues (tri, suppression, vidage)."""
         items = self._sorted_items()
+        _logger.debug("refresh: tri=%r %d photo(s)", self.sort_combo.currentText(), len(items))
         self._order = [it.path for it in items]
         self._thumb_requested.clear()
-        self.setUpdatesEnabled(False)
+        self.table.setUpdatesEnabled(False)
+        self.cards.setUpdatesEnabled(False)
         try:
             self._fill_table(items)
             self._fill_cards(items)
         finally:
-            self.setUpdatesEnabled(True)
+            self.table.setUpdatesEnabled(True)
+            self.cards.setUpdatesEnabled(True)
         self._schedule_thumbnail_request()
 
     def append_items(self, items: list[PhotoItem]) -> None:
@@ -216,7 +229,8 @@ class PhotoGallery(QWidget):
 
     def _fill_table(self, items: list[PhotoItem]) -> None:
         self.table.blockSignals(True)
-        self.table.setRowCount(len(items))
+        if self.table.rowCount() != len(items):
+            self.table.setRowCount(len(items))
         self._table_rows = {}
         for row, item in enumerate(items):
             self._set_table_row_values(row, item)
@@ -252,10 +266,23 @@ class PhotoGallery(QWidget):
 
     def _fill_cards(self, items: list[PhotoItem]) -> None:
         self.cards.blockSignals(True)
-        self.cards.clear()
-        self._card_rows = {}
-        for row, item in enumerate(items):
-            self._add_card_entry(item, row)
+        if self.cards.count() == len(items):
+            # Même nombre de cartes : mise à jour en place, sans clear() coûteux.
+            self._card_rows = {}
+            for row, item in enumerate(items):
+                entry = self.cards.item(row)
+                if entry is not None:
+                    entry.setData(Qt.ItemDataRole.UserRole, item.path)
+                    entry.setText(self._card_label(item))
+                    entry.setForeground(QColor(item.status.color))
+                    pixmap = self._thumbnails.get(item.path)
+                    entry.setIcon(QIcon(pixmap) if pixmap else QIcon())
+                self._card_rows[item.path] = row
+        else:
+            self.cards.clear()
+            self._card_rows = {}
+            for row, item in enumerate(items):
+                self._add_card_entry(item, row)
         self.cards.blockSignals(False)
 
     def _append_card(self, item: PhotoItem) -> None:

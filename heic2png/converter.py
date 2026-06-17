@@ -8,10 +8,14 @@ afin de pouvoir être sérialisées (pickle) et exécutées dans un
 from __future__ import annotations
 
 import datetime as _dt
+import logging
 import os
+import time
 from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import Any
+
+_logger = logging.getLogger(__name__)
 
 from PIL import Image, ExifTags
 import pillow_heif
@@ -211,6 +215,7 @@ def convert_heic_to_png(
         if not overwrite and os.path.exists(destination):
             return ConversionResult(source, destination, True, skipped=True)
 
+        t0 = time.monotonic()
         with Image.open(source) as img:
             save_kwargs: dict[str, Any] = {}
             if keep_exif:
@@ -218,7 +223,8 @@ def convert_heic_to_png(
                 if exif_bytes:
                     save_kwargs["exif"] = exif_bytes
             img.save(destination, format="PNG", **save_kwargs)
-
+        _logger.debug("convert OK %s -> %s (%.2fs)", os.path.basename(source), os.path.basename(destination), time.monotonic() - t0)
         return ConversionResult(source, destination, True)
     except Exception as exc:  # noqa: BLE001 - on remonte l'erreur à l'UI
+        _logger.warning("convert ERREUR %s : %s", os.path.basename(source), exc)
         return ConversionResult(source, None, False, str(exc))

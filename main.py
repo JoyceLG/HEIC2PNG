@@ -9,7 +9,8 @@ import logging
 import pathlib
 import sys
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtGui import QIcon
+from PySide6.QtWidgets import QApplication, QStyle
 
 from heic2png.ui.main_window import MainWindow
 
@@ -36,6 +37,12 @@ def main() -> int:
 
     app = QApplication(sys.argv)
     app.setApplicationName("HEIC → PNG")
+
+    icon = QIcon.fromTheme("image-x-generic")
+    if icon.isNull():
+        icon = app.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon)
+    app.setWindowIcon(icon)
+
     window = MainWindow()
     window.show()
     return app.exec()

@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+_logger = logging.getLogger(__name__)
 
 from PySide6.QtCore import QObject, Signal
 
@@ -41,12 +45,15 @@ class FolderScanWorker(QObject):
         self._cancelled = True
 
     def run(self) -> None:
+        _logger.debug("FolderScanWorker: démarrage scan %s", self._folders)
+        t0 = time.monotonic()
         total = 0
         batch: list[str] = []
         try:
             for folder in self._folders:
                 for root, _dirs, files in os.walk(folder):
                     if self._cancelled:
+                        _logger.debug("FolderScanWorker: annulé")
                         return
                     for name in files:
                         if os.path.splitext(name)[1].lower() in HEIC_EXTENSIONS:
@@ -58,6 +65,7 @@ class FolderScanWorker(QObject):
             if batch:
                 self.found.emit(batch)
         finally:
+            _logger.debug("FolderScanWorker: terminé %d fichier(s) en %.2fs", total, time.monotonic() - t0)
             self.finished.emit(total)
 
 
@@ -79,21 +87,27 @@ class MetadataWorker(QObject):
 
     def run(self) -> None:
         total = len(self._paths)
+        _logger.debug("MetadataWorker: démarrage %d fichier(s) sur %d thread(s)", total, self._max_workers)
+        t0 = time.monotonic()
         done = 0
+        errors = 0
         try:
             with ThreadPoolExecutor(max_workers=self._max_workers) as pool:
                 futures = {pool.submit(_metadata_job, p): p for p in self._paths}
                 for future in as_completed(futures):
                     if self._cancelled:
+                        _logger.debug("MetadataWorker: annulé après %d/%d", done, total)
                         break
                     try:
                         path, meta = future.result()
                         self.loaded.emit(path, meta)
-                    except Exception:  # noqa: BLE001 - best effort
-                        pass
+                    except Exception as exc:  # noqa: BLE001 - best effort
+                        errors += 1
+                        _logger.warning("MetadataWorker: erreur sur %s : %s", futures[future], exc)
                     done += 1
                     self.progress.emit(done, total)
         finally:
+            _logger.debug("MetadataWorker: terminé %d/%d (%d erreur(s)) en %.2fs", done, total, errors, time.monotonic() - t0)
             self.finished.emit()
 
 
@@ -135,6 +149,8 @@ class ConversionWorker(QObject):
         success = 0
         failures = 0
         skipped = 0
+        t0 = time.monotonic()
+        _logger.info("ConversionWorker: démarrage %d photo(s) sur %d thread(s)", total, self._max_workers)
         self.log.emit(
             f"Démarrage de la conversion de {total} photo(s) "
             f"sur {self._max_workers} threads."
@@ -183,6 +199,11 @@ class ConversionWorker(QObject):
             if self._executor is not None:
                 self._executor.shutdown(wait=False)
                 self._executor = None
+            elapsed = time.monotonic() - t0
+            _logger.info(
+                "ConversionWorker: terminé %d OK / %d ignoré(s) / %d erreur(s) en %.2fs",
+                success, skipped, failures, elapsed,
+            )
             self.log.emit(
                 f"Terminé : {success} réussite(s), {failures} échec(s), {skipped} ignorée(s)."
             )
