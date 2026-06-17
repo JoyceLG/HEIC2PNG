@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import multiprocessing
 import os
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PySide6.QtCore import QObject, Signal
 
 from .converter import (
     ConversionResult,
+    HEIC_EXTENSIONS,
     PhotoMetadata,
     convert_heic_to_png,
     extract_metadata,
@@ -21,22 +21,65 @@ def _metadata_job(path: str) -> tuple[str, PhotoMetadata]:
     return path, extract_metadata(path)
 
 
-class MetadataWorker(QObject):
-    """Charge les métadonnées des photos en arrière-plan (threads d'E/S)."""
+class FolderScanWorker(QObject):
+    """Parcourt récursivement un ou plusieurs dossiers à la recherche de HEIC.
 
-    loaded = Signal(str, object)  # chemin, PhotoMetadata
-    finished = Signal()
+    Émet les chemins trouvés par lots pour un affichage progressif, sans
+    bloquer l'interface lors de l'analyse d'arborescences volumineuses.
+    """
 
-    def __init__(self, paths: list[str], max_workers: int | None = None) -> None:
+    found = Signal(list)  # lot de chemins HEIC
+    finished = Signal(int)  # nombre total trouvé
+
+    def __init__(self, folders: list[str], batch_size: int = 200) -> None:
         super().__init__()
-        self._paths = paths
-        self._max_workers = max_workers or min(8, (os.cpu_count() or 4))
+        self._folders = folders
+        self._batch_size = batch_size
         self._cancelled = False
 
     def cancel(self) -> None:
         self._cancelled = True
 
     def run(self) -> None:
+        total = 0
+        batch: list[str] = []
+        try:
+            for folder in self._folders:
+                for root, _dirs, files in os.walk(folder):
+                    if self._cancelled:
+                        return
+                    for name in files:
+                        if os.path.splitext(name)[1].lower() in HEIC_EXTENSIONS:
+                            batch.append(os.path.join(root, name))
+                            total += 1
+                            if len(batch) >= self._batch_size:
+                                self.found.emit(batch)
+                                batch = []
+            if batch:
+                self.found.emit(batch)
+        finally:
+            self.finished.emit(total)
+
+
+class MetadataWorker(QObject):
+    """Charge les métadonnées des photos en arrière-plan (threads d'E/S)."""
+
+    loaded = Signal(str, object)  # chemin, PhotoMetadata
+    progress = Signal(int, int)  # chargés, total
+    finished = Signal()
+
+    def __init__(self, paths: list[str], max_workers: int | None = None) -> None:
+        super().__init__()
+        self._paths = paths
+        self._max_workers = max_workers or min(4, max(1, (os.cpu_count() or 4) // 2))
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def run(self) -> None:
+        total = len(self._paths)
+        done = 0
         try:
             with ThreadPoolExecutor(max_workers=self._max_workers) as pool:
                 futures = {pool.submit(_metadata_job, p): p for p in self._paths}
@@ -47,7 +90,9 @@ class MetadataWorker(QObject):
                         path, meta = future.result()
                         self.loaded.emit(path, meta)
                     except Exception:  # noqa: BLE001 - best effort
-                        continue
+                        pass
+                    done += 1
+                    self.progress.emit(done, total)
         finally:
             self.finished.emit()
 
@@ -58,7 +103,7 @@ class ConversionWorker(QObject):
     progress = Signal(int, int)  # terminés, total
     item_done = Signal(object)  # ConversionResult
     log = Signal(str)
-    finished = Signal(int, int)  # succès, échecs
+    finished = Signal(int, int, int)  # succès, échecs, ignorés
 
     def __init__(
         self,
@@ -73,9 +118,9 @@ class ConversionWorker(QObject):
         self._output_dir = output_dir
         self._keep_exif = keep_exif
         self._overwrite = overwrite
-        self._max_workers = max_workers or (os.cpu_count() or 4)
+        self._max_workers = max_workers or max(1, min(4, (os.cpu_count() or 4) // 2))
         self._cancelled = False
-        self._executor: ProcessPoolExecutor | None = None
+        self._executor: ThreadPoolExecutor | None = None
 
     def cancel(self) -> None:
         self._cancelled = True
@@ -89,17 +134,13 @@ class ConversionWorker(QObject):
         done = 0
         success = 0
         failures = 0
+        skipped = 0
         self.log.emit(
             f"Démarrage de la conversion de {total} photo(s) "
-            f"sur {self._max_workers} processus."
+            f"sur {self._max_workers} threads."
         )
         try:
-            # Contexte « spawn » : indispensable car le processus hôte contient
-            # déjà des threads Qt ; un fork provoquerait des plantages.
-            ctx = multiprocessing.get_context("spawn")
-            self._executor = ProcessPoolExecutor(
-                max_workers=self._max_workers, mp_context=ctx
-            )
+            self._executor = ThreadPoolExecutor(max_workers=self._max_workers)
             futures = {
                 self._executor.submit(
                     convert_heic_to_png,
@@ -120,7 +161,10 @@ class ConversionWorker(QObject):
                     result = ConversionResult(source, None, False, str(exc))
 
                 done += 1
-                if result.success:
+                if result.skipped:
+                    skipped += 1
+                    self.log.emit(f"IGNORÉ  {os.path.basename(source)} (PNG déjà présent)")
+                elif result.success:
                     success += 1
                     self.log.emit(
                         f"OK  {os.path.basename(source)} -> "
@@ -140,6 +184,6 @@ class ConversionWorker(QObject):
                 self._executor.shutdown(wait=False)
                 self._executor = None
             self.log.emit(
-                f"Terminé : {success} réussite(s), {failures} échec(s)."
+                f"Terminé : {success} réussite(s), {failures} échec(s), {skipped} ignorée(s)."
             )
-            self.finished.emit(success, failures)
+            self.finished.emit(success, failures, skipped)

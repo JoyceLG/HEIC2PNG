@@ -66,6 +66,7 @@ class PhotoStore:
     """Conteneur ordonné de ``PhotoItem`` sans doublon de chemin."""
 
     items: list[PhotoItem] = field(default_factory=list)
+    _by_path: dict[str, PhotoItem] = field(default_factory=dict)
 
     def __iter__(self):
         return iter(self.items)
@@ -74,25 +75,26 @@ class PhotoStore:
         return len(self.items)
 
     def paths(self) -> set[str]:
-        return {item.path for item in self.items}
+        return set(self._by_path.keys())
 
     def add(self, path: str) -> PhotoItem | None:
-        """Ajoute une photo si elle n'est pas déjà présente."""
+        """Ajoute une photo si elle n'est pas déjà présente (O(1))."""
         normalized = os.path.abspath(path)
-        if normalized in {os.path.abspath(p) for p in self.paths()}:
+        if normalized in self._by_path:
             return None
         item = PhotoItem(path=normalized)
         self.items.append(item)
+        self._by_path[normalized] = item
         return item
 
     def remove(self, paths: set[str]) -> None:
         self.items = [item for item in self.items if item.path not in paths]
+        for path in paths:
+            self._by_path.pop(path, None)
 
     def clear(self) -> None:
         self.items.clear()
+        self._by_path.clear()
 
     def get(self, path: str) -> PhotoItem | None:
-        for item in self.items:
-            if item.path == path:
-                return item
-        return None
+        return self._by_path.get(path)

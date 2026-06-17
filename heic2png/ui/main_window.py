@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import os
 
-from PySide6.QtCore import Qt, QThread
+from PySide6.QtCore import Qt, QThread, QTimer
 from PySide6.QtWidgets import (
+    QApplication,
     QButtonGroup,
     QCheckBox,
+    QDialog,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -26,9 +29,46 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+_logger = logging.getLogger(__name__)
+
+
+class _ImportDialog(QDialog):
+    """Dialog modale de progression sans processEvents() dans setValue."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Chargement en cours")
+        self.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self.setMinimumWidth(420)
+        self.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
+
+        layout = QVBoxLayout(self)
+        self._label = QLabel("Chargement…")
+        layout.addWidget(self._label)
+
+        self._bar = QProgressBar()
+        self._bar.setTextVisible(True)
+        layout.addWidget(self._bar)
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        btn = QPushButton("Annuler")
+        btn.clicked.connect(self.reject)
+        row.addWidget(btn)
+        layout.addLayout(row)
+
+    def set_label(self, text: str) -> None:
+        self._label.setText(text)
+
+    def set_range(self, minimum: int, maximum: int) -> None:
+        self._bar.setRange(minimum, maximum)
+
+    def set_value(self, value: int) -> None:
+        self._bar.setValue(value)
+
 from ..converter import ConversionResult, is_heic
-from ..worker import ConversionWorker, MetadataWorker
-from .drop_zone import DropZone, _scan_dir
+from ..worker import ConversionWorker, FolderScanWorker, MetadataWorker
+from .drop_zone import DropZone
 from .photo_model import PhotoItem, PhotoStore, PhotoStatus
 from .views import PhotoGallery, ThumbnailLoader
 
@@ -46,6 +86,18 @@ class MainWindow(QMainWindow):
         self._conversion_thread: QThread | None = None
         self._conversion_worker: ConversionWorker | None = None
 
+        # Compteurs de progression d'import (métadonnées).
+        self._meta_total = 0
+        self._meta_done = 0
+        self._scanning = False
+        self._import_dialog: _ImportDialog | None = None
+
+        # Mises à jour galerie groupées pour ne pas saturer le thread principal.
+        self._pending_meta_updates: set[str] = set()
+        self._meta_update_timer = QTimer(self)
+        self._meta_update_timer.setInterval(80)
+        self._meta_update_timer.timeout.connect(self._flush_meta_updates)
+
         self._build_ui()
 
     # ----- Construction de l'interface ---------------------------------
@@ -59,6 +111,7 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         self.gallery = PhotoGallery(self.store)
         self.gallery.selection_changed.connect(self._on_selection_changed)
+        self.gallery.thumbnails_requested.connect(self._load_thumbnails)
         splitter.addWidget(self.gallery)
         splitter.addWidget(self._build_detail_panel())
         splitter.setStretchFactor(0, 3)
@@ -75,6 +128,7 @@ class MainWindow(QMainWindow):
 
         self.drop_zone = DropZone()
         self.drop_zone.files_dropped.connect(self.add_paths)
+        self.drop_zone.folders_dropped.connect(self.add_folders)
         layout.addWidget(self.drop_zone)
 
         buttons = QHBoxLayout()
@@ -94,6 +148,7 @@ class MainWindow(QMainWindow):
         buttons.addStretch(1)
         buttons.addWidget(self.count_label)
         layout.addLayout(buttons)
+
         return box
 
     def _build_detail_panel(self) -> QWidget:
@@ -218,7 +273,7 @@ class MainWindow(QMainWindow):
     def _choose_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Choisir un dossier")
         if folder:
-            self.add_paths(_scan_dir(folder))
+            self.add_folders([folder])
 
     def _choose_destination(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Dossier de destination")
@@ -226,8 +281,37 @@ class MainWindow(QMainWindow):
             self.dest_edit.setText(folder)
             self.mode_dest.setChecked(True)
 
+    # ----- Import asynchrone de dossiers -------------------------------
+    def add_folders(self, folders: list[str]) -> None:
+        """Analyse un ou plusieurs dossiers en arrière-plan puis importe."""
+        if not folders:
+            return
+        self._scanning = True
+        dlg = self._ensure_import_dialog()
+        dlg.set_label("Analyse du dossier…")
+        dlg.set_range(0, 0)
+        dlg.show()
+        worker = FolderScanWorker(folders)
+        worker.found.connect(self._on_scan_found)
+        worker.finished.connect(self._on_scan_finished)
+        self._run_worker(worker)
+
+    def _on_scan_found(self, paths: list[str]) -> None:
+        """Ajoute progressivement les chemins trouvés pendant le scan."""
+        self._ingest_paths(paths)
+
+    def _on_scan_finished(self, total: int) -> None:
+        self._scanning = False
+        self._log(f"Analyse terminée : {total} photo(s) trouvée(s).")
+        if self._meta_total == self._meta_done:
+            self._close_import_dialog()
+
     def add_paths(self, paths: list[str]) -> None:
-        """Ajoute des chemins HEIC au store et lance le chargement asynchrone."""
+        """Ajoute une liste de chemins HEIC (glisser-déposer, sélection)."""
+        self._ingest_paths(paths)
+
+    def _ingest_paths(self, paths: list[str]) -> None:
+        """Ajoute les chemins au store, affiche les cartes et lance les métadonnées."""
         new_items: list[PhotoItem] = []
         for path in paths:
             if not is_heic(path):
@@ -237,11 +321,43 @@ class MainWindow(QMainWindow):
                 new_items.append(item)
         if not new_items:
             return
-        self.gallery.refresh()
         self._update_count()
-        self._log(f"{len(new_items)} photo(s) ajoutée(s).")
+        # Ajout incrémental aux vues (O(k)) : les photos apparaissent aussitôt.
+        self.gallery.append_items(new_items)
+        # Métadonnées en arrière-plan ; vignettes chargées à la demande (vue cartes).
         self._load_metadata([i.path for i in new_items])
-        self._load_thumbnails([i.path for i in new_items])
+
+    # ----- Progression d'import (métadonnées) --------------------------
+    def _ensure_import_dialog(self) -> _ImportDialog:
+        if self._import_dialog is None:
+            dlg = _ImportDialog(self)
+            dlg.rejected.connect(self._cancel_import)
+            self._import_dialog = dlg
+        return self._import_dialog
+
+    def _cancel_import(self) -> None:
+        for _thread, worker in list(self._threads):
+            if hasattr(worker, "cancel"):
+                worker.cancel()
+        self._scanning = False
+        self._meta_update_timer.stop()
+        self._pending_meta_updates.clear()
+        if self._import_dialog is not None:
+            self._import_dialog.close()
+            self._import_dialog = None
+        self._meta_total = 0
+        self._meta_done = 0
+
+    def _close_import_dialog(self) -> None:
+        if self._scanning:
+            return
+        self._meta_update_timer.stop()
+        self._flush_meta_updates()
+        if self._import_dialog is not None:
+            self._import_dialog.close()
+            self._import_dialog = None
+        self._meta_total = 0
+        self._meta_done = 0
 
     def _remove_selected(self) -> None:
         paths = self.gallery.selected_paths()
@@ -281,18 +397,44 @@ class MainWindow(QMainWindow):
         thread.deleteLater()
 
     def _load_metadata(self, paths: list[str]) -> None:
+        if not paths:
+            return
+        self._meta_total += len(paths)
+        dlg = self._ensure_import_dialog()
+        dlg.set_label(f"Chargement des métadonnées… {self._meta_done}/{self._meta_total}")
+        dlg.set_range(0, self._meta_total)
+        dlg.set_value(self._meta_done)
+        dlg.show()
         worker = MetadataWorker(paths)
         worker.loaded.connect(self._on_metadata_loaded)
         self._run_worker(worker)
 
     def _on_metadata_loaded(self, path: str, meta) -> None:
         item = self.store.get(path)
-        if item is None:
-            return
-        item.metadata = meta
-        self.gallery.refresh()
-        if self._current_path == path:
-            self._on_selection_changed(item)
+        if item is not None:
+            item.metadata = meta
+            self._pending_meta_updates.add(path)
+            if not self._meta_update_timer.isActive():
+                self._meta_update_timer.start()
+            if self._current_path == path:
+                self._on_selection_changed(item)
+        self._meta_done += 1
+        dlg = self._import_dialog
+        if not self._scanning and dlg is not None:
+            dlg.set_range(0, self._meta_total)
+            dlg.set_value(self._meta_done)
+            dlg.set_label(
+                f"Chargement des métadonnées… {self._meta_done}/{self._meta_total}"
+            )
+        if self._meta_done >= self._meta_total and not self._scanning:
+            self._close_import_dialog()
+
+    def _flush_meta_updates(self) -> None:
+        paths = list(self._pending_meta_updates)
+        self._pending_meta_updates.clear()
+        self._meta_update_timer.stop()
+        for path in paths:
+            self.gallery.update_item(path)
 
     def _load_thumbnails(self, paths: list[str]) -> None:
         worker = ThumbnailLoader(paths)
@@ -344,17 +486,20 @@ class MainWindow(QMainWindow):
         if output_dir is False:
             return
 
+        # Feedback immédiat avant gallery.refresh() qui peut bloquer quelques secondes.
+        self.progress_label.setText(f"Préparation de {len(paths)} photo(s)…")
+        self.progress.setRange(0, len(paths))
+        self.progress.setValue(0)
+        self._set_converting(True)
+        QApplication.processEvents()
+
         for path in paths:
             item = self.store.get(path)
             if item is not None:
                 item.status = PhotoStatus.PENDING
                 item.error = None
         self.gallery.refresh()
-
-        self.progress.setRange(0, len(paths))
-        self.progress.setValue(0)
         self.progress_label.setText(f"Conversion de {len(paths)} photo(s)…")
-        self._set_converting(True)
 
         worker = ConversionWorker(
             paths,
@@ -391,21 +536,27 @@ class MainWindow(QMainWindow):
         item = self.store.get(result.source)
         if item is None:
             return
-        if result.success:
+        if result.skipped:
+            item.status = PhotoStatus.SKIPPED
+            item.output_path = result.output
+        elif result.success:
             item.status = PhotoStatus.DONE
             item.output_path = result.output
         else:
             item.status = PhotoStatus.ERROR
             item.error = result.error
-        self.gallery.refresh()
+        self.gallery.update_item(result.source)
         if self._current_path == result.source:
             self._on_selection_changed(item)
 
-    def _on_conversion_finished(self, success: int, failures: int) -> None:
+    def _on_conversion_finished(self, success: int, failures: int, skipped: int) -> None:
         self._set_converting(False)
-        self.progress_label.setText(
-            f"Terminé : {success} réussite(s), {failures} échec(s)."
-        )
+        parts = [f"{success} réussite(s)"]
+        if skipped:
+            parts.append(f"{skipped} ignorée(s)")
+        if failures:
+            parts.append(f"{failures} échec(s)")
+        self.progress_label.setText("Terminé : " + ", ".join(parts) + ".")
 
     def _on_conversion_thread_finished(self) -> None:
         thread = self._conversion_thread
@@ -468,6 +619,7 @@ class MainWindow(QMainWindow):
     # ----- Utilitaires --------------------------------------------------
     def _log(self, message: str) -> None:
         self.log_view.appendPlainText(message)
+        _logger.info(message)
 
     def closeEvent(self, event) -> None:  # noqa: N802
         if self._conversion_worker is not None:

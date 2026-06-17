@@ -6,7 +6,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 
 from PIL import Image
-from PySide6.QtCore import QObject, QSize, Qt, Signal
+from PySide6.QtCore import QObject, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QIcon, QImage, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -84,12 +84,26 @@ class PhotoGallery(QWidget):
     """Widget combinant vue liste et vue cartes, avec tri et sélection."""
 
     selection_changed = Signal(object)  # PhotoItem | None
+    thumbnails_requested = Signal(list)  # chemins dont la vignette est à charger
 
     def __init__(self, store: PhotoStore, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._store = store
         self._thumbnails: dict[str, QPixmap] = {}
+        self._card_rows: dict[str, int] = {}
+        self._table_rows: dict[str, int] = {}
+        self._order: list[str] = []
+        self._thumb_requested: set[str] = set()
         self._build_ui()
+
+        # Demande différée des vignettes visibles (anti-rebond du défilement).
+        self._thumb_timer = QTimer(self)
+        self._thumb_timer.setSingleShot(True)
+        self._thumb_timer.setInterval(120)
+        self._thumb_timer.timeout.connect(self._emit_visible_thumbnails)
+        self.cards.verticalScrollBar().valueChanged.connect(
+            self._schedule_thumbnail_request
+        )
 
     # ----- Construction de l'interface ---------------------------------
     def _build_ui(self) -> None:
@@ -153,49 +167,118 @@ class PhotoGallery(QWidget):
         return sorted(self._store.items, key=key, reverse=reverse)
 
     def refresh(self) -> None:
-        """Reconstruit les deux vues à partir du store."""
+        """Reconstruit entièrement les deux vues (tri, suppression, vidage)."""
         items = self._sorted_items()
-        self._fill_table(items)
-        self._fill_cards(items)
+        self._order = [it.path for it in items]
+        self._thumb_requested.clear()
+        self.setUpdatesEnabled(False)
+        try:
+            self._fill_table(items)
+            self._fill_cards(items)
+        finally:
+            self.setUpdatesEnabled(True)
+        self._schedule_thumbnail_request()
+
+    def append_items(self, items: list[PhotoItem]) -> None:
+        """Ajoute des photos aux vues sans tout reconstruire (O(k))."""
+        if not items:
+            return
+        self.table.setUpdatesEnabled(False)
+        self.cards.setUpdatesEnabled(False)
+        try:
+            for item in items:
+                if item.path in self._table_rows:
+                    continue
+                self._append_table_row(item)
+                self._append_card(item)
+                self._order.append(item.path)
+        finally:
+            self.table.setUpdatesEnabled(True)
+            self.cards.setUpdatesEnabled(True)
+        self._schedule_thumbnail_request()
+
+    def update_item(self, path: str) -> None:
+        """Met à jour en place la ligne et la carte d'une photo (O(1))."""
+        item = self._store.get(path)
+        if item is None:
+            return
+        row = self._table_rows.get(path)
+        if row is not None:
+            self.table.blockSignals(True)
+            self._set_table_row_values(row, item)
+            self.table.blockSignals(False)
+        card_row = self._card_rows.get(path)
+        if card_row is not None and card_row < self.cards.count():
+            entry = self.cards.item(card_row)
+            if entry is not None:
+                entry.setText(self._card_label(item))
+                entry.setForeground(QColor(item.status.color))
 
     def _fill_table(self, items: list[PhotoItem]) -> None:
         self.table.blockSignals(True)
         self.table.setRowCount(len(items))
+        self._table_rows = {}
         for row, item in enumerate(items):
-            values = [
-                item.name,
-                item.dimensions,
-                item.metadata.file_size_human if item.metadata else "—",
-                item.created or "—",
-                self._camera_label(item),
-                item.status.value,
-            ]
-            for col, value in enumerate(values):
+            self._set_table_row_values(row, item)
+            self._table_rows[item.path] = row
+        self.table.blockSignals(False)
+
+    def _set_table_row_values(self, row: int, item: PhotoItem) -> None:
+        values = [
+            item.name,
+            item.dimensions,
+            item.metadata.file_size_human if item.metadata else "—",
+            item.created or "—",
+            self._camera_label(item),
+            item.status.value,
+        ]
+        for col, value in enumerate(values):
+            cell = self.table.item(row, col)
+            if cell is None:
                 cell = QTableWidgetItem(value)
                 cell.setData(Qt.ItemDataRole.UserRole, item.path)
-                if col == 5:
-                    cell.setForeground(QColor(item.status.color))
                 self.table.setItem(row, col, cell)
-        self.table.blockSignals(False)
+            else:
+                cell.setText(value)
+                cell.setData(Qt.ItemDataRole.UserRole, item.path)
+            if col == 5:
+                cell.setForeground(QColor(item.status.color))
+
+    def _append_table_row(self, item: PhotoItem) -> None:
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self._set_table_row_values(row, item)
+        self._table_rows[item.path] = row
 
     def _fill_cards(self, items: list[PhotoItem]) -> None:
         self.cards.blockSignals(True)
         self.cards.clear()
-        for item in items:
-            label = (
-                f"{item.name}\n{item.dimensions} · "
-                f"{item.metadata.file_size_human if item.metadata else '—'}\n"
-                f"{item.status.value}"
-            )
-            entry = QListWidgetItem(label)
-            entry.setData(Qt.ItemDataRole.UserRole, item.path)
-            entry.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
-            pixmap = self._thumbnails.get(item.path)
-            if pixmap is not None:
-                entry.setIcon(QIcon(pixmap))
-            entry.setForeground(QColor(item.status.color))
-            self.cards.addItem(entry)
+        self._card_rows = {}
+        for row, item in enumerate(items):
+            self._add_card_entry(item, row)
         self.cards.blockSignals(False)
+
+    def _append_card(self, item: PhotoItem) -> None:
+        self._add_card_entry(item, self.cards.count())
+
+    def _add_card_entry(self, item: PhotoItem, row: int) -> None:
+        entry = QListWidgetItem(self._card_label(item))
+        entry.setData(Qt.ItemDataRole.UserRole, item.path)
+        entry.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
+        pixmap = self._thumbnails.get(item.path)
+        if pixmap is not None:
+            entry.setIcon(QIcon(pixmap))
+        entry.setForeground(QColor(item.status.color))
+        self.cards.addItem(entry)
+        self._card_rows[item.path] = row
+
+    @staticmethod
+    def _card_label(item: PhotoItem) -> str:
+        return (
+            f"{item.name}\n{item.dimensions} · "
+            f"{item.metadata.file_size_human if item.metadata else '—'}\n"
+            f"{item.status.value}"
+        )
 
     @staticmethod
     def _camera_label(item: PhotoItem) -> str:
@@ -208,15 +291,43 @@ class PhotoGallery(QWidget):
     def set_thumbnail(self, path: str, image: QImage) -> None:
         pixmap = QPixmap.fromImage(image)
         self._thumbnails[path] = pixmap
+        row = self._card_rows.get(path)
+        if row is not None and row < self.cards.count():
+            entry = self.cards.item(row)
+            if entry is not None and entry.data(Qt.ItemDataRole.UserRole) == path:
+                entry.setIcon(QIcon(pixmap))
+
+    def _schedule_thumbnail_request(self) -> None:
+        """Planifie une demande de vignettes pour la zone visible."""
+        if not self._thumb_timer.isActive():
+            self._thumb_timer.start()
+
+    def _emit_visible_thumbnails(self) -> None:
+        """Demande le chargement des vignettes des cartes actuellement visibles."""
+        if self.stack.currentIndex() != 1:
+            return  # vignettes inutiles en vue liste
+        viewport = self.cards.viewport().rect()
+        margin = viewport.height()  # précharge environ un écran de plus
+        viewport.adjust(0, -margin, 0, margin)
+        needed: list[str] = []
         for row in range(self.cards.count()):
             entry = self.cards.item(row)
-            if entry.data(Qt.ItemDataRole.UserRole) == path:
-                entry.setIcon(QIcon(pixmap))
-                break
+            if entry is None:
+                continue
+            path = entry.data(Qt.ItemDataRole.UserRole)
+            if path in self._thumb_requested or path in self._thumbnails:
+                continue
+            if self.cards.visualItemRect(entry).intersects(viewport):
+                needed.append(path)
+                self._thumb_requested.add(path)
+        if needed:
+            self.thumbnails_requested.emit(needed)
 
     # ----- Sélection / interactions ------------------------------------
     def _on_view_changed(self, index: int) -> None:
         self.stack.setCurrentIndex(index)
+        if index == 1:
+            self._schedule_thumbnail_request()
 
     def _on_table_selection(self) -> None:
         rows = {idx.row() for idx in self.table.selectedIndexes()}

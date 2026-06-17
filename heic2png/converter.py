@@ -64,6 +64,7 @@ class ConversionResult:
     output: str | None
     success: bool
     error: str | None = None
+    skipped: bool = False
 
 
 def _human_size(num: float) -> str:
@@ -207,8 +208,8 @@ def convert_heic_to_png(
         folder = os.path.dirname(destination)
         if folder:
             os.makedirs(folder, exist_ok=True)
-        if not overwrite:
-            destination = unique_destination(destination)
+        if not overwrite and os.path.exists(destination):
+            return ConversionResult(source, destination, True, skipped=True)
 
         with Image.open(source) as img:
             save_kwargs: dict[str, Any] = {}

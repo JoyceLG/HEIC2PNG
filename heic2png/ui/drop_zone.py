@@ -15,6 +15,7 @@ class DropZone(QLabel):
     """Étiquette interactive servant de cible pour le glisser-déposer."""
 
     files_dropped = Signal(list)  # liste de chemins HEIC
+    folders_dropped = Signal(list)  # liste de dossiers à analyser
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -49,17 +50,21 @@ class DropZone(QLabel):
 
     def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802
         self._set_style(False)
-        paths: list[str] = []
+        files: list[str] = []
+        folders: list[str] = []
         for url in event.mimeData().urls():
             local = url.toLocalFile()
             if not local:
                 continue
             if os.path.isdir(local):
-                paths.extend(_scan_dir(local))
+                folders.append(local)
             elif is_heic(local):
-                paths.append(local)
-        if paths:
-            self.files_dropped.emit(paths)
+                files.append(local)
+        if files or folders:
+            if folders:
+                self.folders_dropped.emit(folders)
+            if files:
+                self.files_dropped.emit(files)
             event.acceptProposedAction()
         else:
             event.ignore()
