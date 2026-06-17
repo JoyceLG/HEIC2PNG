@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 
-from PySide6.QtCore import Qt, QThread, QTimer
+from PySide6.QtCore import Qt, QThread
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication,
@@ -69,7 +69,7 @@ class _ImportDialog(QDialog):
     def set_value(self, value: int) -> None:
         self._bar.setValue(value)
 
-from ..converter import ConversionResult, is_heic
+from ..converter import ConversionResult, PhotoMetadata, is_heic
 from ..worker import ConversionWorker, FolderScanWorker, MetadataWorker
 from .drop_zone import DropZone
 from .photo_model import PhotoItem, PhotoStore, PhotoStatus
@@ -89,17 +89,8 @@ class MainWindow(QMainWindow):
         self._conversion_thread: QThread | None = None
         self._conversion_worker: ConversionWorker | None = None
 
-        # Compteurs de progression d'import (métadonnées).
-        self._meta_total = 0
-        self._meta_done = 0
-        self._scanning = False
         self._import_dialog: _ImportDialog | None = None
-
-        # Mises à jour galerie groupées pour ne pas saturer le thread principal.
-        self._pending_meta_updates: set[str] = set()
-        self._meta_update_timer = QTimer(self)
-        self._meta_update_timer.setInterval(80)
-        self._meta_update_timer.timeout.connect(self._flush_meta_updates)
+        self._exif_loading: set[str] = set()
 
         self._build_ui()
 
@@ -302,7 +293,6 @@ class MainWindow(QMainWindow):
         if not folders:
             return
         _logger.info("add_folders: %s", folders)
-        self._scanning = True
         dlg = self._ensure_import_dialog()
         dlg.set_label("Analyse du dossier…")
         dlg.set_range(0, 0)
@@ -317,10 +307,8 @@ class MainWindow(QMainWindow):
         self._ingest_paths(paths)
 
     def _on_scan_finished(self, total: int) -> None:
-        self._scanning = False
         self._log(f"Analyse terminée : {total} photo(s) trouvée(s).")
-        if self._meta_total == self._meta_done:
-            self._close_import_dialog()
+        self._close_import_dialog()
 
     def add_paths(self, paths: list[str]) -> None:
         """Ajoute une liste de chemins HEIC (glisser-déposer, sélection)."""
@@ -328,21 +316,22 @@ class MainWindow(QMainWindow):
         self._ingest_paths(paths)
 
     def _ingest_paths(self, paths: list[str]) -> None:
-        """Ajoute les chemins au store, affiche les cartes et lance les métadonnées."""
+        """Ajoute les chemins au store et affiche les cartes (taille seule, pas d'EXIF)."""
         new_items: list[PhotoItem] = []
         for path in paths:
             if not is_heic(path):
                 continue
             item = self.store.add(path)
             if item is not None:
+                try:
+                    item.metadata = PhotoMetadata(file_size=os.path.getsize(path))
+                except OSError:
+                    item.metadata = PhotoMetadata()
                 new_items.append(item)
         if not new_items:
             return
         self._update_count()
-        # Ajout incrémental aux vues (O(k)) : les photos apparaissent aussitôt.
         self.gallery.append_items(new_items)
-        # Métadonnées en arrière-plan ; vignettes chargées à la demande (vue cartes).
-        self._load_metadata([i.path for i in new_items])
 
     # ----- Progression d'import (métadonnées) --------------------------
     def _ensure_import_dialog(self) -> _ImportDialog:
@@ -356,25 +345,12 @@ class MainWindow(QMainWindow):
         for _thread, worker in list(self._threads):
             if hasattr(worker, "cancel"):
                 worker.cancel()
-        self._scanning = False
-        self._meta_update_timer.stop()
-        self._pending_meta_updates.clear()
-        if self._import_dialog is not None:
-            self._import_dialog.close()
-            self._import_dialog = None
-        self._meta_total = 0
-        self._meta_done = 0
+        self._close_import_dialog()
 
     def _close_import_dialog(self) -> None:
-        if self._scanning:
-            return
-        self._meta_update_timer.stop()
-        self._flush_meta_updates()
         if self._import_dialog is not None:
             self._import_dialog.close()
             self._import_dialog = None
-        self._meta_total = 0
-        self._meta_done = 0
 
     def _remove_selected(self) -> None:
         paths = self.gallery.selected_paths()
@@ -414,46 +390,6 @@ class MainWindow(QMainWindow):
             self._threads.remove(entry)
         worker.deleteLater()
         thread.deleteLater()
-
-    def _load_metadata(self, paths: list[str]) -> None:
-        if not paths:
-            return
-        self._meta_total += len(paths)
-        dlg = self._ensure_import_dialog()
-        dlg.set_label(f"Chargement des métadonnées… {self._meta_done}/{self._meta_total}")
-        dlg.set_range(0, self._meta_total)
-        dlg.set_value(self._meta_done)
-        dlg.show()
-        worker = MetadataWorker(paths)
-        worker.loaded.connect(self._on_metadata_loaded)
-        self._run_worker(worker)
-
-    def _on_metadata_loaded(self, path: str, meta) -> None:
-        item = self.store.get(path)
-        if item is not None:
-            item.metadata = meta
-            self._pending_meta_updates.add(path)
-            if not self._meta_update_timer.isActive():
-                self._meta_update_timer.start()
-            if self._current_path == path:
-                self._on_selection_changed(item)
-        self._meta_done += 1
-        dlg = self._import_dialog
-        if not self._scanning and dlg is not None:
-            dlg.set_range(0, self._meta_total)
-            dlg.set_value(self._meta_done)
-            dlg.set_label(
-                f"Chargement des métadonnées… {self._meta_done}/{self._meta_total}"
-            )
-        if self._meta_done >= self._meta_total and not self._scanning:
-            self._close_import_dialog()
-
-    def _flush_meta_updates(self) -> None:
-        paths = list(self._pending_meta_updates)
-        self._pending_meta_updates.clear()
-        self._meta_update_timer.stop()
-        for path in paths:
-            self.gallery.update_item(path)
 
     def _load_thumbnails(self, paths: list[str]) -> None:
         worker = ThumbnailLoader(paths)
@@ -623,8 +559,20 @@ class MainWindow(QMainWindow):
         meta = item.metadata
         self.detail_fields["name"].setText(item.name)
         self.detail_fields["path"].setText(item.path)
-        self.detail_fields["dimensions"].setText(item.dimensions)
         self.detail_fields["size"].setText(meta.file_size_human if meta else "—")
+        self.detail_fields["status"].setText(item.status.value)
+        self.detail_fields["output"].setText(item.output_path or item.error or "—")
+
+        if item.exif_loaded:
+            self._populate_exif_fields(item)
+        else:
+            for key in ("dimensions", "created", "camera", "orientation", "gps"):
+                self.detail_fields[key].setText("Chargement…")
+            self._load_exif_for(item)
+
+    def _populate_exif_fields(self, item: PhotoItem) -> None:
+        meta = item.metadata
+        self.detail_fields["dimensions"].setText(meta.dimensions if meta else "—")
         self.detail_fields["created"].setText((meta.created if meta else None) or "—")
         camera = "—"
         if meta:
@@ -635,8 +583,28 @@ class MainWindow(QMainWindow):
             str(meta.orientation) if meta and meta.orientation else "—"
         )
         self.detail_fields["gps"].setText((meta.gps if meta else None) or "—")
-        self.detail_fields["status"].setText(item.status.value)
-        self.detail_fields["output"].setText(item.output_path or item.error or "—")
+
+    def _load_exif_for(self, item: PhotoItem) -> None:
+        if item.path in self._exif_loading:
+            return
+        _logger.debug("_load_exif_for: %s", item.name)
+        self._exif_loading.add(item.path)
+        worker = MetadataWorker([item.path])
+        worker.loaded.connect(self._on_exif_loaded)
+        self._run_worker(worker)
+
+    def _on_exif_loaded(self, path: str, meta) -> None:
+        self._exif_loading.discard(path)
+        item = self.store.get(path)
+        if item is None:
+            return
+        item.metadata = meta
+        item.exif_loaded = True
+        _logger.debug("_on_exif_loaded: %s", os.path.basename(path))
+        if self._current_path == path:
+            self.detail_fields["size"].setText(meta.file_size_human)
+            self._populate_exif_fields(item)
+        self.gallery.update_item(path)
 
     # ----- Utilitaires --------------------------------------------------
     def _log(self, message: str) -> None:

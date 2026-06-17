@@ -39,6 +39,7 @@ class PhotoItem:
     output_path: str | None = None
     error: str | None = None
     thumbnail_loaded: bool = False
+    exif_loaded: bool = False
 
     @property
     def name(self) -> str:

@@ -75,8 +75,6 @@ class ThumbnailLoader(QObject):
 SORT_KEYS = {
     "Nom (A→Z)": (lambda i: i.name.lower(), False),
     "Nom (Z→A)": (lambda i: i.name.lower(), True),
-    "Date (récent→ancien)": (lambda i: i.created or "", True),
-    "Date (ancien→récent)": (lambda i: i.created or "", False),
     "Taille (grand→petit)": (lambda i: i.size, True),
     "Taille (petit→grand)": (lambda i: i.size, False),
     "Statut": (lambda i: i.status.value, False),
@@ -144,17 +142,15 @@ class PhotoGallery(QWidget):
         layout.addWidget(self.stack)
 
     def _build_table(self) -> QTableWidget:
-        table = QTableWidget(0, 6)
-        table.setHorizontalHeaderLabels(
-            ["Nom", "Dimensions", "Taille", "Date", "Appareil", "Statut"]
-        )
+        table = QTableWidget(0, 3)
+        table.setHorizontalHeaderLabels(["Nom", "Taille", "Statut"])
         table.verticalHeader().setVisible(False)
         table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         header = table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for col in range(1, 6):
+        for col in range(1, 3):
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         table.itemSelectionChanged.connect(self._on_table_selection)
         return table
@@ -240,10 +236,7 @@ class PhotoGallery(QWidget):
     def _set_table_row_values(self, row: int, item: PhotoItem) -> None:
         values = [
             item.name,
-            item.dimensions,
             item.metadata.file_size_human if item.metadata else "—",
-            item.created or "—",
-            self._camera_label(item),
             item.status.value,
         ]
         for col, value in enumerate(values):
@@ -255,7 +248,7 @@ class PhotoGallery(QWidget):
             else:
                 cell.setText(value)
                 cell.setData(Qt.ItemDataRole.UserRole, item.path)
-            if col == 5:
+            if col == 2:
                 cell.setForeground(QColor(item.status.color))
 
     def _append_table_row(self, item: PhotoItem) -> None:
@@ -301,11 +294,8 @@ class PhotoGallery(QWidget):
 
     @staticmethod
     def _card_label(item: PhotoItem) -> str:
-        return (
-            f"{item.name}\n{item.dimensions} · "
-            f"{item.metadata.file_size_human if item.metadata else '—'}\n"
-            f"{item.status.value}"
-        )
+        size = item.metadata.file_size_human if item.metadata else "—"
+        return f"{item.name}\n{size}\n{item.status.value}"
 
     @staticmethod
     def _camera_label(item: PhotoItem) -> str:
